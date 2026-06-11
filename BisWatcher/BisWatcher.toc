@@ -1,0 +1,8 @@
+## Interface: 30403
+## Title: BisWatcher
+## Notes: Watches chat for linked items on your BiS list. Import via /biswatch import.
+## Version: 0.1.0
+## Author: lucas
+## SavedVariables: BisWatcherDB
+
+BisWatcher.lua
