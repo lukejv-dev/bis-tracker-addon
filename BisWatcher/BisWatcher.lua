@@ -7,7 +7,8 @@
 --   /biswatch import os <string>           (appends a new OS list)
 
 local ADDON = "BisWatcher"
-local FORMAT_VERSION = "BISWATCH1"
+-- Import formats this addon understands. v2 added the raid field; v1 strings
+-- still parse so nothing saved before the upgrade is lost. See HEADER_FIELDS.
 
 -- SavedVariables shape:
 --   BisWatcherDB = {
@@ -32,6 +33,21 @@ local function ensureDB()
     BisWatcherDB.rolls.ms = BisWatcherDB.rolls.ms or "/roll"
     BisWatcherDB.rolls.os = BisWatcherDB.rolls.os or "/roll 99"
     BisWatcherDB.os = BisWatcherDB.os or {}
+    -- On by default: the whole point is catching a link you'd otherwise miss
+    -- while looking at your bags.
+    if BisWatcherDB.sound == nil then BisWatcherDB.sound = true end
+    BisWatcherDB.soundName = BisWatcherDB.soundName or "TellMessage"
+end
+
+-- Sounds available from the config window. All ship with 3.3.5a.
+local SOUND_CHOICES = { "TellMessage", "RaidWarning", "ReadyCheck", "AuctionWindowOpen", "LootWindowOpenEmpty" }
+
+local function playAlert()
+    if not BisWatcherDB.sound then return end
+    local name = BisWatcherDB.soundName or "TellMessage"
+    -- WoW 3.3.5a takes a sound name here; later clients take a numeric id.
+    -- pcall so an unknown name can never break the prompt itself.
+    pcall(PlaySound, name)
 end
 
 local function countItems(list)
@@ -49,15 +65,31 @@ local function split(s, sep)
     return out
 end
 
+-- Header field counts per version. v2 added the raid, so the split differs
+-- by exactly one field; everything after the header is unchanged.
+local HEADER_FIELDS = { BISWATCH1 = 5, BISWATCH2 = 6 }
+
 local function parseImport(str)
     if not str or str == "" then return nil, "empty string" end
     str = string.gsub(str, "^%s+", ""):gsub("%s+$", "")
-    local header_part, items_part = string.match(str, "^([^~]+~[^~]+~[^~]+~[^~]+~[^~]+)~(.+)$")
-    if not header_part then return nil, "malformed (no header)" end
-    local h = split(header_part, "~")
-    if h[1] ~= FORMAT_VERSION then
-        return nil, "unsupported format version: " .. tostring(h[1])
+
+    local version = string.match(str, "^([^~]+)~")
+    if not version then return nil, "malformed (no header)" end
+
+    local fieldCount = HEADER_FIELDS[version]
+    if not fieldCount then
+        return nil, "unsupported format version: " .. tostring(version)
     end
+
+    -- Build the header pattern from the field count rather than writing one
+    -- literal per version, so a v3 is a table entry rather than a new branch.
+    local headerPattern = "^(" .. string.rep("[^~]+", fieldCount, "~") .. ")~(.+)$"
+    local header_part, items_part = string.match(str, headerPattern)
+    if not header_part then return nil, "malformed (no header)" end
+
+    local h = split(header_part, "~")
+    if #h < fieldCount then return nil, "malformed (short header)" end
+
     local items = {}
     local count = 0
     for chunk in string.gmatch(items_part, "([^;]+)") do
@@ -72,8 +104,17 @@ local function parseImport(str)
             count = count + 1
         end
     end
+
     return {
-        header = { source = h[2], class = h[3], spec = h[4], phase = h[5] },
+        header = {
+            version = version,
+            source  = h[2],
+            class   = h[3],
+            spec    = h[4],
+            phase   = h[5],
+            -- v1 strings covered a whole phase; "all" says the same thing.
+            raid    = h[6] or "all",
+        },
         items  = items,
         count  = count,
     }
@@ -81,8 +122,9 @@ end
 
 local function describeHeader(h)
     if not h or not h.class then return "?" end
-    return string.format("%s / %s / Phase %s (%s)",
-        h.class, h.spec, h.phase, h.source or "?")
+    local raid = (h.raid and h.raid ~= "all") and h.raid or "all raids"
+    return string.format("%s / %s / Phase %s / %s (%s)",
+        h.class, h.spec, h.phase, raid, h.source or "?")
 end
 
 -- ----------------------------------------------------- lookup across lists ----
@@ -112,6 +154,7 @@ end
 -- ------------------------------------------------------------- roll popup ----
 
 local popup
+local lastPopupSummary = ""
 local function createPopup()
     local f = CreateFrame("Frame", "BisWatcherRollPopup", UIParent, "BackdropTemplate")
     f:SetSize(420, 140)
@@ -218,11 +261,18 @@ local function showPopup(itemID, matches)
             label = "OS" .. m.index
         end
         local sr = m.entry.sr and " [SR]" or ""
-        table.insert(slotInfo, string.format("%s: %s%s|r %s%s", label, rankColor, rankLabel, m.entry.slot, sr))
+        -- Naming the spec and raid matters for a hybrid running several
+        -- lists: "OS2" alone doesn't tell you which one just fired.
+        local h = m.header or {}
+        local origin = h.spec and (" |cff888888(" .. h.spec
+            .. ((h.raid and h.raid ~= "all") and (" · " .. h.raid) or "") .. ")|r") or ""
+        table.insert(slotInfo, string.format("%s: %s%s|r %s%s%s", label, rankColor, rankLabel, m.entry.slot, sr, origin))
     end
 
     popup.itemLine:SetText(link)
     popup.specLine:SetText(table.concat(slotInfo, "   "))
+    -- Kept for the test harness, which cannot read a rendered FontString.
+    lastPopupSummary = table.concat(slotInfo, "   ")
 
     -- Disable buttons that don't apply
     if hasMS then popup.msBtn:Enable() else popup.msBtn:Disable() end
@@ -230,6 +280,10 @@ local function showPopup(itemID, matches)
 
     popup.activeItemID = itemID
     popup:Show()
+
+    -- One prompt, one sound. Deliberately here rather than in the matches
+    -- loop above: a hybrid with three OS lists should not get a triple beep.
+    playAlert()
 
     -- Auto-pass timeout
     if popup.timer then popup.timer:Cancel(); popup.timer = nil end
@@ -330,6 +384,22 @@ local function createConfigWindow()
     f.close:SetPoint("TOPRIGHT", -6, -6)
 
     -- Enable / disable scanning
+    f.soundCB = CreateFrame("CheckButton", nil, f, "UICheckButtonTemplate")
+    f.soundCB:SetPoint("TOPLEFT", 200, -44)
+    f.soundCB.text = f.soundCB:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    f.soundCB.text:SetPoint("LEFT", f.soundCB, "RIGHT", 2, 0)
+    f.soundCB.text:SetText("Play a sound")
+    f.soundCB:SetScript("OnClick", function(self)
+        BisWatcherDB.sound = not not self:GetChecked()
+        if BisWatcherDB.sound then playAlert() end   -- hear the change you just made
+    end)
+
+    f.soundTest = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    f.soundTest:SetSize(60, 20)
+    f.soundTest:SetPoint("LEFT", f.soundCB.text, "RIGHT", 8, 0)
+    f.soundTest:SetText("Test")
+    f.soundTest:SetScript("OnClick", function() playAlert() end)
+
     f.enableCB = CreateFrame("CheckButton", nil, f, "UICheckButtonTemplate")
     f.enableCB:SetPoint("TOPLEFT", 18, -44)
     f.enableCB.text = f.enableCB:CreateFontString(nil, "OVERLAY", "GameFontNormal")
@@ -391,6 +461,8 @@ local function createConfigWindow()
     end
 
     local pasteEdit = CreateFrame("EditBox", nil, scroll)
+    -- Also hung off the frame so "/biswatch paste" can focus it directly.
+    f.pasteEdit = pasteEdit
     pasteEdit:SetMultiLine(true)
     pasteEdit:SetAutoFocus(false)
     pasteEdit:SetFontObject(ChatFontNormal)
@@ -470,6 +542,7 @@ refreshConfigContent = function()
     if not configFrame then return end
     -- Sync controls from DB
     configFrame.enableCB:SetChecked(BisWatcherDB.enabled and true or false)
+    configFrame.soundCB:SetChecked(BisWatcherDB.sound and true or false)
     configFrame.msRoll:SetText(BisWatcherDB.rolls.ms or "/roll")
     configFrame.osRoll:SetText(BisWatcherDB.rolls.os or "/roll 99")
 
@@ -544,6 +617,39 @@ SlashCmdList["BISWATCHER"] = function(input)
         return
     end
 
+    -- Opens the config window with the paste box focused. Pasting a string is
+    -- the single most common thing anyone does here, and hunting for the box
+    -- inside a settings window every raid night is friction for no reason.
+    if cmd == "paste" then
+        showConfig()
+        if configFrame and configFrame.pasteEdit then
+            configFrame.pasteEdit:SetFocus()
+            configFrame.pasteEdit:HighlightText()
+        end
+        msg("paste your import string, then press |cffffd100Import as MS|r or |cffffd100Import as OS|r.")
+        return
+    end
+
+    if cmd == "sound" then
+        local arg = rest and string.lower(rest) or ""
+        if arg == "on" or arg == "off" then
+            BisWatcherDB.sound = (arg == "on")
+            msg("sound: " .. (BisWatcherDB.sound and "|cff1eff00ON|r" or "|cffff5555OFF|r"))
+        elseif arg == "test" then
+            playAlert()
+            msg("played: " .. tostring(BisWatcherDB.soundName))
+        elseif arg ~= "" then
+            BisWatcherDB.soundName = rest
+            playAlert()
+            msg("sound set to |cffffd100" .. rest .. "|r")
+        else
+            msg("sound is " .. (BisWatcherDB.sound and "|cff1eff00ON|r" or "|cffff5555OFF|r")
+                .. " (" .. tostring(BisWatcherDB.soundName) .. "). "
+                .. "usage: /biswatch sound on|off|test|<SoundName>")
+        end
+        return
+    end
+
     if cmd == "help" then
         msg("|cff9482c5/biswatch|r opens the config window. Slash shortcuts:")
         msg("  |cffffd100import ms <string>|r       -- replace main-spec watchlist")
@@ -553,6 +659,8 @@ SlashCmdList["BISWATCHER"] = function(input)
         msg("  |cffffd100clear [ms|os|all]|r         -- clear watchlists (default: ms)")
         msg("  |cffffd100roll ms <command>|r        -- set MS roll command (default /roll)")
         msg("  |cffffd100roll os <command>|r        -- set OS roll command (default /roll 99)")
+        msg("  |cffffd100paste|r                    -- open the config window ready to paste")
+        msg("  |cffffd100sound on|off|test|r        -- notification sound when a prompt fires")
         msg("  |cffffd100toggle|r                   -- enable/disable scanning")
         msg("  |cffffd100test <itemID>|r            -- simulate a link")
         return
@@ -562,6 +670,10 @@ SlashCmdList["BISWATCHER"] = function(input)
         local kind, str = string.match(rest, "^(%S+)%s+(.+)$")
         if not kind then msg("usage: /biswatch import <ms|os> <string>"); return end
         kind = string.lower(kind)
+        -- The web tool's copy button yields a whole "/biswatch import ms ..."
+        -- command, so a doubled prefix is an easy paste to make. Take the
+        -- string either way rather than failing on something recoverable.
+        str = string.gsub(str, "^/%S+%s+import%s+%S+%s+", "")
         local parsed, err = parseImport(str)
         if not parsed then msg("|cffff5555import failed:|r " .. err); return end
         if kind == "ms" then
@@ -656,4 +768,38 @@ SlashCmdList["BISWATCHER"] = function(input)
     end
 
     msg("unknown command. try /biswatch help")
+end
+
+-- ------------------------------------------------------------ test hooks ----
+--
+-- WoW addons have no module system, so everything above is file-local. This
+-- table is how `spec/` reaches the pure logic — import parsing, list matching,
+-- the debounce — from outside the game. It is not a public API and nothing in
+-- the addon reads it.
+--
+-- The frames and the sound still need a real client to verify; see spec/wow.js.
+
+BisWatcher = BisWatcher or {}
+BisWatcher._test = {
+    parseImport = parseImport,
+    findMatches = findMatches,
+    countItems  = countItems,
+    describeHeader = describeHeader,
+    onItemLinkSeen = function(id) onItemLinkSeen(id) end,
+    scanMessage = function(text) scanMessage(text) end,
+    previewSound = function() playAlert() end,
+    lastPopupSummary = function() return lastPopupSummary end,
+    soundChoices = SOUND_CHOICES,
+    applyImport = function(kind, parsed)
+        if kind == "ms" then
+            BisWatcherDB.ms = parsed
+        else
+            table.insert(BisWatcherDB.os, parsed)
+        end
+    end,
+}
+
+-- ADDON_LOADED normally does this; tests boot without the event loop.
+function ensureDB_forTests()
+    ensureDB()
 end
